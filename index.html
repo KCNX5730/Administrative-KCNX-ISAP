@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KCNX Secure Router</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #fff; padding: 16px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .app-container { width: 100%; max-width: 520px; background: #1e293b; padding: 20px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); display: flex; flex-direction: column; gap: 14px; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 12px; }
+        .header h3 { color: #38bdf8; font-size: 1.15rem; font-weight: 700; }
+        .identity-badge { background: #0284c7; padding: 6px 14px; border-radius: 20px; font-weight: bold; font-size: 0.85rem; }
+        .feed { height: 360px; background: #0f172a; border: 1px solid #334155; padding: 12px; overflow-y: auto; border-radius: 8px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
+        .msg-card { padding: 10px 14px; border-radius: 8px; font-size: 0.9rem; max-width: 85%; line-height: 1.4; word-break: break-word; }
+        .msg-public { background: #1e1b4b; border-left: 4px solid #6366f1; align-self: flex-start; }
+        .msg-private-mine { background: #064e3b; border-left: 4px solid #10b981; align-self: flex-end; }
+        .msg-private-theirs { background: #14532d; border-left: 4px solid #22c55e; align-self: flex-start; }
+        .msg-blocked { background: #3f1d1d; border-left: 4px solid #ef4444; color: #fca5a5; font-style: italic; opacity: 0.6; align-self: flex-start; }
+        .meta { font-size: 0.72rem; color: #94a3b8; margin-bottom: 4px; display: block; font-weight: 600; text-transform: uppercase; }
+        .status-bar { font-size: 0.8rem; color: #34d399; display: flex; align-items: center; gap: 8px; background: #0f172a; padding: 8px 12px; border-radius: 6px; border: 1px solid #1e293b; }
+        .status-dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; display: inline-block; }
+        .controls-container { background: #111827; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; display: flex; flex-direction: column; gap: 10px; }
+        select, textarea { background: #0f172a; border: 1px solid #334155; color: #fff; padding: 10px; border-radius: 6px; font-size: 0.9rem; }
+        .input-row { display: flex; gap: 10px; }
+        textarea { flex-grow: 1; height: 50px; resize: none; }
+        button { background: #0ea5e9; color: white; border: none; padding: 0 24px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="app-container">
+    <div class="header">
+        <h3>KCNX Secure Router</h3>
+        <div class="identity-badge" id="myIdentityDisplay">Routing ID...</div>
+    </div>
+    <div class="feed" id="chatFeed"></div>
+    <div class="status-bar">
+        <span class="status-dot"></span>
+        <span id="networkStatusLabel">Syncing mesh...</span>
+    </div>
+    <div class="controls-container">
+        <select id="msgTarget">
+            <option value="ALL">Everyone (Public Broadcast Layer)</option>
+        </select>
+        <div class="input-row">
+            <textarea id="msgTextInput" placeholder="Write data payload..."></textarea>
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    const CONFIG = {
+        ROOM_NAMESPACE: "kcnx_secure_mesh_v3_production",
+        MAX_NODE_SEARCH: 35
+    };
+
+    let myAssignedNumber = sessionStorage.getItem('kcnx_session_node_id');
+    let peer = null;
+    let activeConnections = {};
+    let adminConnection = null;
+    let localMessageHistory = [];
+
+    function populateDropdownMenu() {
+        const select = document.getElementById('msgTarget');
+        for (let i = 1; i <= CONFIG.MAX_NODE_SEARCH; i++) {
+            const option = document.createElement('option');
+            option.value = i.toString();
+            option.innerText = `Restrict To: User #${i} Only`;
+            select.appendChild(option);
+        }
+    }
+
+    async function initAutonomousRouter() {
+        populateDropdownMenu();
+        if (myAssignedNumber) {
+            setupP2PMeshNode(parseInt(myAssignedNumber));
+        } else {
+            await searchAvailableNodeSlot(1);
+        }
+    }
+
+    async function searchAvailableNodeSlot(slotNumber) {
+        if (slotNumber > CONFIG.MAX_NODE_SEARCH) {
+            slotNumber = Math.floor(Math.random() * CONFIG.MAX_NODE_SEARCH) + 1;
+            setupP2PMeshNode(slotNumber);
+            return;
+        }
+        const testId = `${CONFIG.ROOM_NAMESPACE}_node_${slotNumber}`;
+        const testPeer = new Peer(testId);
+        testPeer.on('open', () => { testPeer.destroy(); setupP2PMeshNode(slotNumber); });
+        testPeer.on('error', () => { testPeer.destroy(); searchAvailableNodeSlot(slotNumber + 1); });
+    }
+
+    function setupP2PMeshNode(nodeId) {
+        myAssignedNumber = nodeId.toString();
+        sessionStorage.setItem('kcnx_session_node_id', myAssignedNumber);
+        document.getElementById('myIdentityDisplay').innerText = `Device Node: User #${myAssignedNumber}`;
+        
+        const finalId = `${CONFIG.ROOM_NAMESPACE}_node_${myAssignedNumber}`;
+        peer = new Peer(finalId);
+
+        peer.on('open', () => {
+            document.getElementById('networkStatusLabel').innerText = "Mesh Connected.";
+            discoverAndLinkPeers();
+            connectToAdminConsole();
+        });
+
+        peer.on('connection', (conn) => { bindConnectionEvents(conn); });
+    }
+
+    function connectToAdminConsole() {
+        // Silently bridge connection to the admin command webpage if it's currently online
+        const adminId = `${CONFIG.ROOM_NAMESPACE}_MASTER_ADMIN_CONSOLE`;
+        adminConnection = peer.connect(adminId, { reliable: true });
+        adminConnection.on('open', () => {
+            // Report current device presence telemetry to admin
+            adminConnection.send({
+                type: "TELEMETRY_REPORT",
+                userNumber: myAssignedNumber,
+                userAgent: navigator.userAgent.substring(0, 40),
+                peerId: peer.id
+            });
+        });
+    }
+
+    function discoverAndLinkPeers() {
+        for (let i = 1; i <= CONFIG.MAX_NODE_SEARCH; i++) {
+            if (i.toString() !== myAssignedNumber) {
+                bindConnectionEvents(peer.connect(`${CONFIG.ROOM_NAMESPACE}_node_${i}`, { reliable: true }));
+            }
+        }
+    }
+
+    function bindConnectionEvents(conn) {
+        conn.on('open', () => { activeConnections[conn.peer] = conn; });
+        conn.on('data', (jsonPacket) => {
+            const packet = typeof jsonPacket === 'string' ? JSON.parse(jsonPacket) : jsonPacket;
+            
+            if (packet.type === "ADMIN_FORCED_REMAP") {
+                if (myAssignedNumber === packet.targetOldNo) {
+                    myAssignedNumber = packet.forceNewNo;
+                    sessionStorage.setItem('kcnx_session_node_id', myAssignedNumber);
+                    location.reload();
+                }
+                return;
+            }
+
+            if (!localMessageHistory.some(m => m.id === packet.id)) {
+                localMessageHistory.push(packet);
+                renderFeed();
+                // Silently push a carbon copy transcript up to the admin window
+                if (adminConnection && adminConnection.open) adminConnection.send(packet);
+            }
+        });
+    }
+
+    function sendMessage() {
+        const textInput = document.getElementById('msgTextInput');
+        const text = textInput.value.trim();
+        const target = document.getElementById('msgTarget').value;
+        if (!text) return;
+
+        const packet = {
+            id: Date.now() + "_" + Math.random().toString(36).substr(2, 5),
+            sender: myAssignedNumber,
+            target: target,
+            text: text
+        };
+
+        localMessageHistory.push(packet);
+        renderFeed();
+        
+        if (adminConnection && adminConnection.open) adminConnection.send(packet);
+
+        Object.values(activeConnections).forEach(conn => {
+            if (conn.open) conn.send(packet);
+        });
+        textInput.value = '';
+    }
+
+    function renderFeed() {
+        const feed = document.getElementById('chatFeed');
+        feed.innerHTML = '';
+        localMessageHistory.forEach(msg => {
+            const card = document.createElement('div');
+            const isPublic = msg.target === "ALL";
+            const isFromMe = msg.sender === myAssignedNumber;
+            const isForMe = msg.target === myAssignedNumber;
+
+            if (isPublic) { card.className = "msg-card msg-public"; card.innerHTML = `<span class="meta">From User #${msg.sender} 📢</span> ${msg.text}`; }
+            else if (isFromMe) { card.className = "msg-card msg-private-mine"; card.innerHTML = `<span class="meta">To User #${msg.target} 🔒</span> ${msg.text}`; }
+            else if (isForMe) { card.className = "msg-card msg-private-theirs"; card.innerHTML = `<span class="meta">From User #${msg.sender} 🔒</span> ${msg.text}`; }
+            else { card.className = "msg-card msg-blocked"; card.innerHTML = `<span class="meta">System Protected</span> 🔒 This Message is not for you.`; }
+            feed.appendChild(card);
+        });
+        feed.scrollTop = feed.scrollHeight;
+    }
+
+    initAutonomousRouter();
+</script>
+</body>
+  </html>
+  
